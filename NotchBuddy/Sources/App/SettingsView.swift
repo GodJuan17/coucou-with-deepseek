@@ -4,27 +4,24 @@ import AppKit
 
 struct SettingsView: View {
     @ObservedObject private var state = AppState.shared
-    @State private var apiKey: String = KeychainStore.shared.get("anthropic-api-key") ?? ""
+    @State private var apiKey: String = KeychainStore.shared.get("deepseek-api-key") ?? ""
 
-    // Claude model — dynamic list fetched from the API, static fallback if unavailable
+    // DeepSeek models (static — DeepSeek exposes two chat models)
     private static let fallbackModels: [(id: String, label: String)] = [
-        ("claude-sonnet-4-6",         "Claude Sonnet 4.6"),
-        ("claude-sonnet-5-5",         "Claude Sonnet 5.5"),
-        ("claude-opus-5-5",           "Claude Opus 5.5"),
-        ("claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
+        ("deepseek-chat",     "DeepSeek Chat (V3)"),
+        ("deepseek-reasoner", "DeepSeek Reasoner (R1)"),
     ]
     private static let customModelTag = "__custom__"
-    @State private var fetchedModels: [(id: String, label: String)] = []
     @State private var modelChoice: String = {
-        let m = AppState.shared.claudeModel
+        let m = AppState.shared.deepSeekModel
         return SettingsView.fallbackModels.contains { $0.id == m } ? m : SettingsView.customModelTag
     }()
     @State private var customModel: String = {
-        let m = AppState.shared.claudeModel
+        let m = AppState.shared.deepSeekModel
         return SettingsView.fallbackModels.contains { $0.id == m } ? "" : m
     }()
     private var displayModels: [(id: String, label: String)] {
-        fetchedModels.isEmpty ? Self.fallbackModels : fetchedModels
+        Self.fallbackModels
     }
     @State private var launchAtStartup: Bool = (SMAppService.mainApp.status == .enabled)
     @State private var statusMessage: String = ""
@@ -68,12 +65,12 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 18) {
 
                 // MARK: API
-                GroupBox("Anthropic API") {
+                GroupBox("DeepSeek API") {
                     VStack(alignment: .leading, spacing: 8) {
-                        SecureField("API key (sk-ant-…)", text: $apiKey)
+                        SecureField("API key (sk-…)", text: $apiKey)
                             .textFieldStyle(.roundedBorder)
                         Button("Save") {
-                            KeychainStore.shared.set("anthropic-api-key", value: apiKey)
+                            KeychainStore.shared.set("deepseek-api-key", value: apiKey)
                             statusMessage = "✓ Key saved."
                         }
                         .buttonStyle(.borderedProminent)
@@ -88,19 +85,19 @@ struct SettingsView: View {
                         }
                         .onChange(of: modelChoice) { _, choice in
                             if choice != Self.customModelTag {
-                                state.claudeModel = choice
+                                state.deepSeekModel = choice
                             } else {
                                 applyCustomModel(customModel)
                             }
                         }
 
                         if modelChoice == Self.customModelTag {
-                            TextField("Model ID (e.g. claude-sonnet-4-6)", text: $customModel)
+                            TextField("Model ID (e.g. deepseek-chat)", text: $customModel)
                                 .textFieldStyle(.roundedBorder)
                                 .onChange(of: customModel) { _, value in applyCustomModel(value) }
                         }
 
-                        Text("Used by the chat. The list comes from your Anthropic account.")
+                        Text("Used by the chat. DeepSeek offers deepseek-chat and deepseek-reasoner.")
                             .font(.system(size: 11))
                             .foregroundColor(.secondary)
                     }
@@ -386,25 +383,6 @@ struct SettingsView: View {
             }
             .padding(20)
         }
-        .onAppear {
-            guard fetchedModels.isEmpty,
-                  let key = KeychainStore.shared.get("anthropic-api-key"), !key.isEmpty else { return }
-            Task {
-                let models = await ClaudeService.fetchModels(apiKey: key)
-                guard !models.isEmpty else { return }
-                await MainActor.run {
-                    fetchedModels = models
-                    let m = state.claudeModel
-                    if models.contains(where: { $0.id == m }) {
-                        modelChoice = m
-                        customModel = ""
-                    } else if modelChoice != Self.customModelTag {
-                        modelChoice = Self.customModelTag
-                        customModel = m
-                    }
-                }
-            }
-        }
         .frame(minWidth: 420, maxWidth: .infinity, minHeight: 320, maxHeight: .infinity)
     }
 
@@ -412,7 +390,7 @@ struct SettingsView: View {
 
     private func applyCustomModel(_ value: String) {
         let id = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !id.isEmpty { state.claudeModel = id }
+        if !id.isEmpty { state.deepSeekModel = id }
     }
 
     private func toggleStartup(_ on: Bool) {

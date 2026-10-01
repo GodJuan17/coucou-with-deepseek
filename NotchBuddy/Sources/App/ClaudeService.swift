@@ -61,7 +61,7 @@ final class KeychainStore: @unchecked Sendable {
     private let lock = NSLock()
 
     private static let allKeys = [
-        "anthropic-api-key",
+        "deepseek-api-key",
         "resend-api-key", "resend-from",
         "n8n-url", "n8n-api-key",
         "vercel-token",
@@ -100,41 +100,21 @@ final class KeychainStore: @unchecked Sendable {
     }
 }
 
-// MARK: - Claude API
+// MARK: - DeepSeek API
 
 @MainActor
-final class ClaudeService {
-    static let shared = ClaudeService()
+final class DeepSeekService {
+    static let shared = DeepSeekService()
 
-    private let endpoint = URL(string: "https://api.anthropic.com/v1/messages")!
-    private let anthropicVersion = "2023-06-01"
+    private let endpoint = URL(string: "https://api.deepseek.com/chat/completions")!
 
-    // MARK: - Model list
-
-    /// Fetches available models from the Anthropic API in the order the API returns them
-    /// (newest first). Returns an empty array on any error — callers fall back to a static list.
-    static func fetchModels(apiKey: String) async -> [(id: String, label: String)] {
-        guard let url = URL(string: "https://api.anthropic.com/v1/models?limit=100") else { return [] }
-        var req = URLRequest(url: url, timeoutInterval: 10)
-        req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
-        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        guard let (data, response) = try? await URLSession.shared.data(for: req),
-              (response as? HTTPURLResponse)?.statusCode == 200,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let items = json["data"] as? [[String: Any]] else { return [] }
-        return items.compactMap { item in
-            guard let id = item["id"] as? String,
-                  let name = item["display_name"] as? String else { return nil }
-            return (id: id, label: name)
-        }
-    }
     /// Chosen in Settings; falls back to the default when the field is left empty.
     private var model: String {
-        let m = AppState.shared.claudeModel.trimmingCharacters(in: .whitespacesAndNewlines)
-        return m.isEmpty ? AppState.defaultClaudeModel : m
+        let m = AppState.shared.deepSeekModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        return m.isEmpty ? AppState.defaultDeepSeekModel : m
     }
 
-    var apiKey: String? { KeychainStore.shared.get("anthropic-api-key") }
+    var apiKey: String? { KeychainStore.shared.get("deepseek-api-key") }
 
     // Multi-turn conversation messages (for API)
     private var conversationMessages: [[String: Any]] = []
@@ -145,16 +125,11 @@ final class ClaudeService {
 
     private let systemPrompt = """
     You are Mochi, Louis's personal AI assistant embedded in the notch of his Mac. \
-    You have web search access and can help with absolutely anything — research, coding, finding places, recommendations, tasks, questions. \
     Respond in the user's language. Be thorough and complete — use as much detail as the task requires. \
     No markdown formatting (no **, no ##, no bullet dashes). Use plain text with line breaks.
     """
 
-    private let webSearchTools: [[String: Any]] = [
-        ["type": "web_search_20250305", "name": "web_search", "max_uses": 5]
-    ]
-
-    // MARK: - Chat (multi-turn, natural text + web search)
+    // MARK: - Chat (multi-turn, natural text)
 
     func chat(query: String, context: PromptContext?, state: AppState) async {
         guard let key = apiKey, !key.isEmpty else {
@@ -162,37 +137,27 @@ final class ClaudeService {
             return
         }
 
-        // Build user content for this turn
-        var userContent: [[String: Any]] = []
-
-        // Add file/window context on first message only
+        // Build user content for this turn (context only on the first message)
+        var userText = ""
         if conversationMessages.isEmpty, let context = context {
-            switch context {
-            case .window(let app, let title, let url):
-                var text = "Context — App: \(app), Window: \(title)"
-                if let url = url { text += ", URL: \(url)" }
-                userContent.append(["type": "text", "text": text])
-            case .file(let name, let fileURL):
-                if let fileURL = fileURL, let block = readFileAsBlock(url: fileURL) {
-                    userContent.append(block)
-                }
-                userContent.append(["type": "text", "text": "File: \(name)"])
-            }
+            let ctx = contextText(context)
+            if !ctx.isEmpty { userText += ctx + "\n\n" }
         }
-        userContent.append(["type": "text", "text": query])
+        userText += query
 
-        conversationMessages.append(["role": "user", "content": userContent])
+        conversationMessages.append(["role": "user", "content": userText])
+
+        var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
+        messages.append(contentsOf: conversationMessages)
 
         let body: [String: Any] = [
             "model": model,
-            "max_tokens": 4096,
-            "tools": webSearchTools,
-            "system": systemPrompt,
-            "messages": conversationMessages,
+            "messages": messages,
+            "stream": false,
         ]
 
         do {
-            let data = try await callAPI(body: body, key: key, beta: "web-search-2025-03-05")
+            let data = try await callAPI(body: body, key: key)
             await handleChatResult(data, state: state)
         } catch {
             conversationMessages.removeLast()
@@ -200,29 +165,20 @@ final class ClaudeService {
         }
     }
 
-    // MARK: - Structured search (M8 — window attach + web search)
+    // MARK: - Structured search (window attach)
 
     func search(query: String, context: PromptContext?, state: AppState) async {
         guard let key = apiKey, !key.isEmpty else {
-            await showError("Anthropic API key missing. Open settings to configure it.", state: state)
+            await showError("DeepSeek API key missing. Open settings to configure it.", state: state)
             return
         }
 
-        var userContent: [[String: Any]] = []
-        switch context {
-        case .window(let appName, let title, let url):
-            var text = "App: \(appName)\nWindow title: \(title)"
-            if let url = url { text += "\nURL: \(url)" }
-            text += "\n\nRequest: \(query)"
-            userContent.append(["type": "text", "text": text])
-        case .file(let name, let fileURL):
-            if let fileURL = fileURL, let fileBlock = readFileAsBlock(url: fileURL) {
-                userContent.append(fileBlock)
-            }
-            userContent.append(["type": "text", "text": "File: \(name)\n\nRequest: \(query)"])
-        case nil:
-            userContent.append(["type": "text", "text": query])
+        var userText = ""
+        if let context = context {
+            let ctx = contextText(context)
+            if !ctx.isEmpty { userText += ctx + "\n\n" }
         }
+        userText += query
 
         let system = """
         You are an assistant built into the notch of a Mac. Reply in English, short and precise.
@@ -231,20 +187,17 @@ final class ClaudeService {
         Maximum 3 items. "url" is optional. "note" is optional.
         """
 
-        let tools: [[String: Any]] = [
-            ["type": "web_search_20250305", "name": "web_search", "max_uses": 3]
-        ]
-
         let body: [String: Any] = [
             "model": model,
-            "max_tokens": 1024,
-            "tools": tools,
-            "system": system,
-            "messages": [["role": "user", "content": userContent]],
+            "messages": [
+                ["role": "system", "content": system],
+                ["role": "user", "content": userText],
+            ],
+            "stream": false,
         ]
 
         do {
-            let result = try await callAPI(body: body, key: key, beta: "web-search-2025-03-05")
+            let result = try await callAPI(body: body, key: key)
             await handleResult(result, state: state)
         } catch {
             await showError(error.localizedDescription, state: state)
@@ -253,35 +206,26 @@ final class ClaudeService {
 
     // MARK: - API call
 
-    private func callAPI(body: [String: Any], key: String, beta: String? = nil) async throws -> Data {
+    private func callAPI(body: [String: Any], key: String) async throws -> Data {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        request.setValue(key, forHTTPHeaderField: "x-api-key")
-        request.setValue(anthropicVersion, forHTTPHeaderField: "anthropic-version")
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "content-type")
-        if let beta { request.setValue(beta, forHTTPHeaderField: "anthropic-beta") }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         request.timeoutInterval = 45
 
         let (data, response) = try await URLSession.shared.data(for: request)
 
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            // Parse Anthropic error format: {"type":"error","error":{"type":"…","message":"…"}}
+            // DeepSeek error format: {"error":{"message":"...","type":"...","code":"..."}}
             if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let err = json["error"] as? [String: Any],
-               let errType = err["type"] as? String,
                let errMsg = err["message"] as? String {
-                if errType == "not_found_error" {
-                    let id = AppState.shared.claudeModel
-                    throw NSError(domain: "Claude", code: 0,
-                        userInfo: [NSLocalizedDescriptionKey:
-                            "Model not found: \(id). Pick another one in Settings."])
-                }
-                throw NSError(domain: "Claude", code: 0,
+                throw NSError(domain: "DeepSeek", code: 0,
                     userInfo: [NSLocalizedDescriptionKey: errMsg])
             }
             let msg = String(data: data, encoding: .utf8) ?? "unknown error"
-            throw NSError(domain: "Claude", code: 0, userInfo: [NSLocalizedDescriptionKey: msg])
+            throw NSError(domain: "DeepSeek", code: 0, userInfo: [NSLocalizedDescriptionKey: msg])
         }
         return data
     }
@@ -290,21 +234,16 @@ final class ClaudeService {
 
     private func handleChatResult(_ data: Data, state: AppState) async {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = json["content"] as? [[String: Any]] else {
+              let choices = json["choices"] as? [[String: Any]],
+              let message = choices.first?["message"] as? [String: Any],
+              let text = message["content"] as? String, !text.isEmpty else {
             await showError("Unexpected API response.", state: state)
             return
         }
 
-        // Store full content (includes tool_use/tool_result blocks) for correct multi-turn context
-        conversationMessages.append(["role": "assistant", "content": content])
+        // Store the assistant reply for multi-turn context
+        conversationMessages.append(["role": "assistant", "content": text])
 
-        guard let textBlock = content.first(where: { $0["type"] as? String == "text" }),
-              let text = textBlock["text"] as? String, !text.isEmpty else {
-            await showError("No response text.", state: state)
-            return
-        }
-
-        // Add to display history
         state.chatHistory.append(ChatMessage(role: .assistant, content: text.trimmingCharacters(in: .whitespacesAndNewlines)))
 
         state.stateOverride = nil
@@ -315,11 +254,11 @@ final class ClaudeService {
     // MARK: - Structured result handler
 
     private func handleResult(_ data: Data, state: AppState) async {
-        // Extract text from Anthropic response (may contain tool_use / web_search_tool_result blocks)
+        // DeepSeek returns OpenAI-compatible chat completions.
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = json["content"] as? [[String: Any]],
-              let textBlock = content.first(where: { $0["type"] as? String == "text" }),
-              let text = textBlock["text"] as? String else {
+              let choices = json["choices"] as? [[String: Any]],
+              let message = choices.first?["message"] as? [String: Any],
+              let text = message["content"] as? String else {
             await showError("Unexpected API response.", state: state)
             return
         }
@@ -352,7 +291,7 @@ final class ClaudeService {
             // Fallback: show raw text in 3-line chunks
             let lines = cleanText.components(separatedBy: "\n").filter { !$0.isEmpty }.prefix(3)
             state.searchResult = SearchResult(
-                title: "Claude's response",
+                title: "DeepSeek's response",
                 items: lines.map { ResultItem(label: $0, detail: "", url: nil) },
                 note: nil
             )
@@ -369,28 +308,38 @@ final class ClaudeService {
         state.view = .note
     }
 
-    // MARK: - File content block builder
+    // MARK: - Context helpers
 
-    private func readFileAsBlock(url: URL) -> [String: Any]? {
+    private func contextText(_ context: PromptContext) -> String {
+        switch context {
+        case .window(let app, let title, let url):
+            var text = "Context — App: \(app), Window: \(title)"
+            if let url = url { text += ", URL: \(url)" }
+            return text
+        case .file(let name, let fileURL):
+            if let fileURL = fileURL, let contents = readFileAsText(url: fileURL) {
+                return "File: \(name)\n\n\(contents)"
+            }
+            return "File: \(name)"
+        }
+    }
+
+    private func readFileAsText(url: URL) -> String? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         let ext = url.pathExtension.lowercased()
-        let base64 = data.base64EncodedString()
 
-        if ext == "pdf" {
-            return ["type": "document", "source": ["type": "base64", "media_type": "application/pdf", "data": base64]]
-        } else if ["jpg", "jpeg"].contains(ext) {
-            return ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": base64]]
-        } else if ext == "png" {
-            return ["type": "image", "source": ["type": "base64", "media_type": "image/png", "data": base64]]
-        } else if ext == "gif" {
-            return ["type": "image", "source": ["type": "base64", "media_type": "image/gif", "data": base64]]
-        } else if ext == "webp" {
-            return ["type": "image", "source": ["type": "base64", "media_type": "image/webp", "data": base64]]
-        } else {
-            // Text/code — inline as text if <= 200 KB
-            guard data.count <= 200_000,
-                  let text = String(data: data, encoding: .utf8) else { return nil }
-            return ["type": "text", "text": "File contents:\n\(text)"]
-        }
+        // DeepSeek's chat model accepts text only; binary/image files are referenced
+        // by name rather than their raw contents.
+        let textExtensions: Set<String> = [
+            "txt", "md", "markdown", "swift", "py", "js", "ts", "tsx", "jsx",
+            "json", "yaml", "yml", "toml", "html", "css", "scss", "csv",
+            "c", "h", "cpp", "hpp", "m", "mm", "go", "rs", "java", "kt",
+            "rb", "php", "sh", "zsh", "bash", "sql", "xml", "plist",
+        ]
+        guard textExtensions.contains(ext) else { return nil }
+
+        guard data.count <= 200_000,
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        return "File contents:\n\(text)"
     }
 }
